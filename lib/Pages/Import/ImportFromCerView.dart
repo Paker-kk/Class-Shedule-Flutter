@@ -1,6 +1,5 @@
 import 'dart:io';
 import 'dart:async';
-import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:umeng_common_sdk/umeng_common_sdk.dart';
@@ -12,6 +11,7 @@ import '../../generated/l10n.dart';
 import '../../Utils/CourseParser.dart';
 import '../../Components/Toast.dart';
 import '../../Resources/Url.dart';
+import '../../Utils/ImportRemoteDataSource.dart';
 
 class ImportFromCerView extends StatefulWidget {
   final Map config;
@@ -27,6 +27,10 @@ class ImportFromCerView extends StatefulWidget {
 class ImportFromCerViewState extends State<ImportFromCerView> {
   late final WebViewController _webViewController;
   final WebViewCookieManager cookieManager = WebViewCookieManager();
+  final ImportRemoteDataSource _remoteDataSource =
+      ImportRemoteDataSource.instance;
+  bool _isImporting = false;
+  String? _lastImportedUrl;
 
   @override
   void initState() {
@@ -38,12 +42,7 @@ class ImportFromCerViewState extends State<ImportFromCerView> {
       ..setNavigationDelegate(
         NavigationDelegate(
           onPageFinished: (String url) {
-            if (widget.config['redirectUrl'] != '' &&
-                url.startsWith(widget.config['redirectUrl'])) {
-              _webViewController.loadRequest(Uri.parse(widget.config['targetUrl']));
-            } else if (url.startsWith(widget.config['targetUrl'])) {
-              import(_webViewController, context);
-            }
+            _handlePageFinished(url);
           },
         ),
       )
@@ -61,76 +60,160 @@ class ImportFromCerViewState extends State<ImportFromCerView> {
 
   @override
   Widget build(BuildContext context) {
+    final color = Theme.of(context).colorScheme;
     return Scaffold(
       appBar: AppBar(
+        elevation: 0,
+        backgroundColor: color.surface,
         title: Text(widget.config['page_title']),
         actions: <Widget>[
           IconButton(
             icon: const Icon(Icons.refresh),
             onPressed: () async {
-              await cookieManager.clearCookies();
-              _webViewController.loadRequest(Uri.parse(widget.config['initialUrl']));
+              await _restartImportSession();
             },
           ),
         ],
       ),
-      body: Builder(
-        builder: (BuildContext context) {
-          return Column(children: <Widget>[
-            widget.config['banner_content'] == null
-                ? Container()
-                : MaterialBanner(
-                    forceActionsBelow: true,
-                    content: FittedBox(
-                        fit: BoxFit.scaleDown,
-                        alignment: Alignment.centerLeft,
-                        child: Text(widget.config['banner_content'],
-                            style: const TextStyle(color: Colors.white))),
-                    backgroundColor: Theme.of(context).primaryColor,
-                    actions: [
-                      TextButton(
-                          style: TextButton.styleFrom(
-                              foregroundColor: Colors.white,
-                              backgroundColor: Theme.of(context).primaryColor),
-                          child: Text(widget.config['banner_action']),
-                          onPressed: () => launch(widget.config['banner_url'])),
-                    ],
+      backgroundColor: color.surface,
+      body: LayoutBuilder(builder: (context, constraints) {
+        final width = constraints.maxWidth;
+        final maxWidth = width > 1200 ? 1100.0 : 980.0;
+        final horizontalPadding = width < 560 ? 12.0 : 20.0;
+        return Align(
+          alignment: Alignment.topCenter,
+          child: SizedBox(
+            width: maxWidth,
+            child: Padding(
+              padding: EdgeInsets.fromLTRB(
+                  horizontalPadding, 10, horizontalPadding, 12),
+              child: Column(
+                children: [
+                  _buildInfoBanner(context),
+                  const SizedBox(height: 10),
+                  Expanded(
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(20),
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          border: Border.all(
+                              color: color.outlineVariant.withOpacity(0.35)),
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: WebViewWidget(controller: _webViewController),
+                      ),
+                    ),
                   ),
-            Expanded(
-                child: WebViewWidget(controller: _webViewController))
-          ]);
-        },
+                ],
+              ),
+            ),
+          ),
+        );
+      }),
+    );
+  }
+
+  Widget _buildInfoBanner(BuildContext context) {
+    if (widget.config['banner_content'] == null) {
+      return const SizedBox.shrink();
+    }
+    final color = Theme.of(context).colorScheme;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: color.surfaceContainerHighest.withOpacity(0.5),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: color.outlineVariant.withOpacity(0.35)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(Icons.info_outline_rounded, size: 18, color: color.primary),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              widget.config['banner_content'],
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: color.onSurfaceVariant,
+                    height: 1.35,
+                  ),
+            ),
+          ),
+          if ((widget.config['banner_url'] ?? '').toString().isNotEmpty)
+            TextButton(
+              onPressed: () =>
+                  launchUrl(Uri.parse(widget.config['banner_url'])),
+              child: Text(widget.config['banner_action']),
+            ),
+        ],
       ),
     );
   }
 
-  import(WebViewController controller, BuildContext context,
-      {String? res}) async {
-    String response = "";
-    if (res != null) {
-      response = res;
-    } else {
-      Toast.showToast(S.of(context).class_parse_toast_importing, context);
-      await controller.runJavaScript(widget.config['preExtractJS'] ?? '');
-      await Future.delayed(Duration(seconds: widget.config['delayTime'] ?? 0));
-      
-      var result = await controller
-          .runJavaScriptReturningResult(widget.config['extractJS']);
-      response = result.toString();
-      
-      if (response.startsWith('"') && response.endsWith('"')) {
-         response = response.substring(1, response.length - 1);
-      }
-    }
-    response = response.replaceAll('\\u003C', '<').replaceAll('\\"', '"');
+  Future<void> _restartImportSession() async {
+    _isImporting = false;
+    _lastImportedUrl = null;
+    await cookieManager.clearCookies();
+    await _webViewController
+        .loadRequest(Uri.parse(widget.config['initialUrl']));
+  }
 
+  Future<void> _handlePageFinished(String url) async {
+    if (widget.config['redirectUrl'] != '' &&
+        url.startsWith(widget.config['redirectUrl'])) {
+      await _webViewController
+          .loadRequest(Uri.parse(widget.config['targetUrl']));
+      return;
+    }
+    if (!url.startsWith(widget.config['targetUrl'])) {
+      return;
+    }
+    if (_isImporting || _lastImportedUrl == url) {
+      return;
+    }
+    _lastImportedUrl = url;
+    await import(_webViewController, context);
+  }
+
+  Future<void> import(
+    WebViewController controller,
+    BuildContext context, {
+    String? res,
+  }) async {
+    if (_isImporting) {
+      return;
+    }
+    _isImporting = true;
+    String response = '';
     try {
+      if (res != null) {
+        response = res;
+      } else {
+        Toast.showToast(S.of(context).class_parse_toast_importing, context);
+        await controller.runJavaScript(widget.config['preExtractJS'] ?? '');
+        await Future.delayed(
+            Duration(seconds: widget.config['delayTime'] ?? 0));
+
+        var result = await controller
+            .runJavaScriptReturningResult(widget.config['extractJS']);
+        response = result.toString();
+
+        if (response.startsWith('"') && response.endsWith('"')) {
+          response = response.substring(1, response.length - 1);
+        }
+      }
+      response = response.replaceAll('\\u003C', '<').replaceAll('\\"', '"');
+
       CourseParser cp = CourseParser(response);
       String courseTableName = cp.parseCourseName();
       int rst = await cp.addCourseTable(courseTableName, context);
       await cp.parseCourse(rst);
       UmengCommonSdk.onEvent(
           "class_import", {"type": "cer", "action": "success"});
+      if (!mounted) {
+        return;
+      }
       Toast.showToast(S.of(context).class_parse_toast_success, context);
       Navigator.of(context).pop(true);
     } catch (e) {
@@ -147,14 +230,15 @@ class ImportFromCerViewState extends State<ImportFromCerView> {
         "way": "cer"
       };
       try {
-        await Dio()
-            .post(Url.URL_BACKEND + "/log/log", data: FormData.fromMap(info));
-      } catch (e) {
-        print(e);
-      }
+        await _remoteDataSource.postImportErrorLog(info);
+      } catch (_) {}
 
       UmengCommonSdk.onEvent("class_import", {"type": "cer", "action": "fail"});
-      
+
+      if (!mounted) {
+        return;
+      }
+
       showDialog<String>(
           barrierDismissible: false,
           context: context,
@@ -174,11 +258,12 @@ class ImportFromCerViewState extends State<ImportFromCerView> {
                           await Clipboard.setData(
                               ClipboardData(text: errorCode));
                           if (Platform.isIOS) {
-                            launch(Url.QQ_GROUP_APPLE_URL);
+                            await launchUrl(Uri.parse(Url.QQ_GROUP_APPLE_URL));
                           } else if (Platform.isAndroid) {
-                            launch(Url.QQ_GROUP_ANDROID_URL);
+                            await launchUrl(
+                                Uri.parse(Url.QQ_GROUP_ANDROID_URL));
                           } else if (Platform.operatingSystem == 'ohos') {
-                            launch(Url.QQ_GROUP_OHOS_URL);
+                            await launchUrl(Uri.parse(Url.QQ_GROUP_OHOS_URL));
                           }
                           Navigator.of(context).pop();
                         })),
@@ -195,6 +280,8 @@ class ImportFromCerViewState extends State<ImportFromCerView> {
               ],
             );
           });
+    } finally {
+      _isImporting = false;
     }
   }
 }
